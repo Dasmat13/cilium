@@ -131,6 +131,8 @@ func (n *noInterruptedConnections) Run(ctx context.Context, t *check.Test) {
 	// Only store restart counters which will be used later when running the same
 	// test case, but w/o --conn-disrupt-test-setup.
 	if ct.Params().ConnDisruptTestSetup {
+		armEnvoyCloseLoggers(ctx, ct)
+
 		file, err := os.Create(ct.Params().ConnDisruptTestRestartsPath)
 		if err != nil {
 			t.Fatalf("Failed to create %q file for writing conn disrupt test temp results: %s",
@@ -222,6 +224,109 @@ func connDisruptPeerState(ctx context.Context, ct *check.ConnectivityTest, clien
 		}
 
 		sb.WriteString(envoyStallCounters(ctx, ct, pod.Spec.NodeName))
+	}
+
+	// The local close happens on the CLIENT's node, so collect the close
+	// evidence and the per-node close counters for every node, not just the
+	// server's.
+	for _, cp := range ct.CiliumPods() {
+		sb.WriteString(envoyLocalCloseCounters(ctx, ct, cp))
+		sb.WriteString(envoyCloseEvidence(ctx, ct, cp.Pod.Spec.NodeName))
+	}
+
+	return sb.String()
+}
+
+// envoyLocalCloseCounters reports, per node, which local-close path Envoy took.
+// WIP DO NOT MERGE. max_requests and max_duration_reached being 0 while
+// destroy_local_with_active_rq is 1 is what narrows this to idle-timeout vs
+// pool drain.
+func envoyLocalCloseCounters(ctx context.Context, ct *check.ConnectivityTest, cp check.Pod) string {
+	const filter = "upstream_cx_(destroy_local_with_active_rq|destroy_remote_with_active_rq|idle_timeout|max_requests|max_duration_reached|total)|upstream_rq_(total|completed|pending_overflow)"
+	out, err := cp.K8sClient.ExecInPod(ctx, cp.Pod.Namespace, cp.Pod.Name, "cilium-agent",
+		[]string{"bash", "-c", "cilium-dbg envoy admin metrics -f '" + filter +
+			"' 2>/dev/null | grep -E 'egress-cluster\"|ingress-cluster\"' | grep -vE ' 0$'"})
+	if err != nil {
+		return fmt.Sprintf("\n  [close-counters] %s: %s", cp.Pod.Name, err)
+	}
+	return fmt.Sprintf("\n  --- local-close counters on %s (%s) ---\n%s",
+		cp.Pod.Spec.NodeName, cp.Pod.Name, strings.TrimSpace(out.String()))
+}
+
+// armEnvoyCloseLoggers raises the Envoy loggers that name the upstream
+// connection close, before the agent is restarted. WIP DO NOT MERGE.
+//
+// Why: the failing request dies because Envoy destroys its own upstream
+// connection while the request is still active. Proven by
+// upstream_cx_destroy_local_with_active_rq=1 (and _remote_=0) on exactly the
+// nodes whose client restarted, 0 on the nodes whose client survived, across 9
+// client samples in 3 runs with no exception. What the counters cannot say is
+// WHICH local close path ran. upstream_cx_max_requests and
+// upstream_cx_max_duration_reached are 0 everywhere, so it is either the 3s
+// upstream idle timeout racing a request assignment or a connection-pool drain
+// during restore, and both are cumulative so elimination is not proof.
+//
+// codec_client.h onIdleTimeout() logs "idle timeout" and conn_pool_base.cc
+// drainConnectionsImpl() logs "draining" at debug on the connection/pool
+// loggers, so raising just those two names says which one fired, without the
+// ~1600 lines/s that --log-level trace produces and that has been rotating the
+// evidence away.
+func armEnvoyCloseLoggers(ctx context.Context, ct *check.ConnectivityTest) {
+	if !ct.ShouldRunConnDisruptL7Traffic() {
+		return
+	}
+
+	for _, cp := range ct.CiliumPods() {
+		out, err := cp.K8sClient.ExecInPod(ctx, cp.Pod.Namespace, cp.Pod.Name, "cilium-agent",
+			[]string{"cilium-dbg", "envoy", "admin", "logging", "set", "loggers",
+				"connection=debug", "pool=debug", "client=debug", "upstream=debug"})
+		if err != nil {
+			ct.Infof("[close-probe] %s: unable to raise Envoy loggers: %s", cp.Pod.Name, err)
+			continue
+		}
+		ct.Infof("[close-probe] %s: raised Envoy connection/pool loggers: %s",
+			cp.Pod.Name, strings.TrimSpace(out.String()))
+	}
+}
+
+// envoyCloseEvidence greps the cilium-envoy container log on the given node for
+// the lines that name the local upstream close. WIP DO NOT MERGE.
+func envoyCloseEvidence(ctx context.Context, ct *check.ConnectivityTest, nodeName string) string {
+	if nodeName == "" {
+		return ""
+	}
+
+	pods, err := ct.K8sClient().ListPods(ctx, ct.Params().CiliumNamespace, metav1.ListOptions{
+		LabelSelector: "k8s-app=cilium-envoy",
+		FieldSelector: "spec.nodeName=" + nodeName,
+	})
+	if err != nil || len(pods.Items) == 0 {
+		return fmt.Sprintf("\n  [close-probe] no cilium-envoy pod on node %s (%v)", nodeName, err)
+	}
+
+	var logs bytes.Buffer
+	if err := ct.K8sClient().GetLogs(ctx, pods.Items[0].Namespace, pods.Items[0].Name, "cilium-envoy",
+		corev1.PodLogOptions{TailLines: ptr.To[int64](20000)}, &logs); err != nil {
+		return fmt.Sprintf("\n  [close-probe] unable to read %s logs: %s", pods.Items[0].Name, err)
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "\n  --- envoy close evidence on %s (%s) ---", nodeName, pods.Items[0].Name)
+	var hits int
+	for line := range strings.SplitSeq(logs.String(), "\n") {
+		low := strings.ToLower(line)
+		if strings.Contains(low, "idle timeout") || strings.Contains(low, "drain") ||
+			strings.Contains(low, "closing") || strings.Contains(low, "remote close") ||
+			strings.Contains(low, "disconnect") {
+			fmt.Fprintf(&sb, "\n    %s", line)
+			if hits++; hits >= 60 {
+				sb.WriteString("\n    ... truncated")
+				break
+			}
+		}
+	}
+	if hits == 0 {
+		sb.WriteString("\n    (no idle-timeout/drain/closing lines found - loggers may not have been raised, or the log rotated)")
 	}
 
 	return sb.String()
