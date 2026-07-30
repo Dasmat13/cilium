@@ -296,29 +296,44 @@ func armEnvoyCloseLoggers(ctx context.Context, ct *check.ConnectivityTest) {
 	}
 }
 
-// envoyCloseEvidence greps the cilium-envoy container log on the given node for
-// the lines that name the local upstream close. WIP DO NOT MERGE.
+// envoyCloseEvidence mines the Envoy log for the lines that describe the
+// request that never got a response. WIP DO NOT MERGE.
+//
+// Reads the log FILE, not the container log. envoy.log.path makes Envoy write
+// to /var/run/cilium/envoy/sockets/envoy.log on a hostPath that the agent also
+// mounts, so it is not subject to kubelet's 10Mi stdout rotation. That rotation
+// is why every previous attempt lost the window: with the debug loggers raised
+// Envoy emits ~1000 lines/s, so the container log covered only the last ~70s
+// and always started AFTER the client death.
 func envoyCloseEvidence(ctx context.Context, ct *check.ConnectivityTest, nodeName string) string {
 	if nodeName == "" {
 		return ""
 	}
 
-	pods, err := ct.K8sClient().ListPods(ctx, ct.Params().CiliumNamespace, metav1.ListOptions{
-		LabelSelector: "k8s-app=cilium-envoy",
-		FieldSelector: "spec.nodeName=" + nodeName,
-	})
-	if err != nil || len(pods.Items) == 0 {
-		return fmt.Sprintf("\n  [close-probe] no cilium-envoy pod on node %s (%v)", nodeName, err)
+	// Read via the agent on the same node: it mounts the same /var/run/cilium.
+	var cp *check.Pod
+	for _, p := range ct.CiliumPods() {
+		if p.Pod.Spec.NodeName == nodeName {
+			cp = &p
+			break
+		}
+	}
+	if cp == nil {
+		return fmt.Sprintf("\n  [close-probe] no cilium agent pod on node %s", nodeName)
 	}
 
-	var logs bytes.Buffer
-	if err := ct.K8sClient().GetLogs(ctx, pods.Items[0].Namespace, pods.Items[0].Name, "cilium-envoy",
-		corev1.PodLogOptions{TailLines: ptr.To[int64](20000)}, &logs); err != nil {
-		return fmt.Sprintf("\n  [close-probe] unable to read %s logs: %s", pods.Items[0].Name, err)
+	out, err := cp.K8sClient.ExecInPod(ctx, cp.Pod.Namespace, cp.Pod.Name, "cilium-agent",
+		[]string{"bash", "-c", "tail -c 20000000 /var/run/cilium/envoy/sockets/envoy.log 2>/dev/null || echo __NO_ENVOY_LOG_FILE__"})
+	if err != nil {
+		return fmt.Sprintf("\n  [close-probe] unable to read envoy.log on %s: %s", nodeName, err)
+	}
+	logs := out
+	if strings.Contains(logs.String(), "__NO_ENVOY_LOG_FILE__") {
+		return fmt.Sprintf("\n  [close-probe] %s: no envoy.log file (is envoy.log.path set?)", nodeName)
 	}
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "\n  --- envoy close evidence on %s (%s) ---", nodeName, pods.Items[0].Name)
+	fmt.Fprintf(&sb, "\n  --- envoy close evidence on %s (from envoy.log, %d bytes) ---", nodeName, logs.Len())
 
 	// A previous run proved the killing event is "remote close" followed by
 	// "disconnect. resetting 1 pending requests" - the PEER closed, not Envoy.
