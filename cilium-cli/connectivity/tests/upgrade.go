@@ -164,10 +164,104 @@ func (n *noInterruptedConnections) Run(ctx context.Context, t *check.Test) {
 		if prevCount, found := prevRestartCount[pod]; !found {
 			t.Fatalf("Could not find Pod %s restart count", pod)
 		} else if prevCount != count {
-			t.Fatalf("Pod %s flow was interrupted (restart count does not match %s != %s)%s",
-				pod, prevCount, count, restartReason(ctx, ct, podClients[pod], pod))
+			t.Fatalf("Pod %s flow was interrupted (restart count does not match %s != %s)%s%s",
+				pod, prevCount, count, restartReason(ctx, ct, podClients[pod], pod),
+				connDisruptPeerState(ctx, ct, podClients[pod]))
 		}
 	}
+}
+
+// connDisruptPeerState dumps the state of the conn-disrupt SERVER pods when a
+// client restart is reported. WIP DO NOT MERGE: debug instrumentation.
+//
+// Why: an L7 conn-disrupt client dies because the server stops answering for
+// several seconds (6.8s and 11.7s stalls observed), but every artifact we
+// collect today describes the CLIENT. restartReason() reports the client's
+// termination state and its own log tail, the server pod's application log is
+// not collected at all, and the cilium-agent/cilium-envoy logs in the sysdump
+// have already rotated past the stall by the time it is taken. So we can see
+// that the server went quiet but not why.
+func connDisruptPeerState(ctx context.Context, ct *check.ConnectivityTest, client *k8s.Client) string {
+	if client == nil {
+		return ""
+	}
+
+	pods, err := client.ListPods(ctx, ct.Params().TestNamespace, metav1.ListOptions{
+		LabelSelector: "kind=" + check.KindTestConnDisruptL7Traffic,
+	})
+	if err != nil {
+		return fmt.Sprintf("\n[peer-state] unable to list L7 conn-disrupt pods: %s", err)
+	}
+
+	var sb strings.Builder
+	sb.WriteString("\n[peer-state] L7 conn-disrupt server pods at failure time:")
+	for _, pod := range pods.Items {
+		if !strings.HasPrefix(pod.Name, "test-conn-disrupt-server") {
+			continue
+		}
+
+		var restarts int32
+		var ready bool
+		if len(pod.Status.ContainerStatuses) > 0 {
+			restarts = pod.Status.ContainerStatuses[0].RestartCount
+			ready = pod.Status.ContainerStatuses[0].Ready
+		}
+		fmt.Fprintf(&sb, "\n  %s node=%s phase=%s ready=%t restarts=%d",
+			pod.Name, pod.Spec.NodeName, pod.Status.Phase, ready, restarts)
+
+		// The server is a plain HTTP echo; if it logged nothing while the
+		// client was timing out, the stall is below the application.
+		var logs bytes.Buffer
+		if err := client.GetLogs(ctx, pod.Namespace, pod.Name, pod.Spec.Containers[0].Name,
+			corev1.PodLogOptions{TailLines: ptr.To[int64](30), Timestamps: true}, &logs); err == nil {
+			if trimmed := strings.TrimSpace(logs.String()); trimmed != "" {
+				fmt.Fprintf(&sb, "\n  --- %s log tail ---\n%s", pod.Name, trimmed)
+			} else {
+				fmt.Fprintf(&sb, "\n  --- %s produced no log output ---", pod.Name)
+			}
+		}
+
+		sb.WriteString(envoyStallCounters(ctx, ct, pod.Spec.NodeName))
+	}
+
+	return sb.String()
+}
+
+// envoyStallCounters dumps the Envoy counters that describe a stall on the
+// node hosting the conn-disrupt server. WIP DO NOT MERGE: debug instrumentation.
+//
+// Why: these are cumulative and are served from the running cilium-envoy, so
+// unlike the container logs they still cover the stall window when the sysdump
+// is taken minutes later. upstream_cx_destroy_with_active_rq / _idle_timeout
+// tell us whether Envoy tore the upstream connection down under an in-flight
+// request, downstream_rq_idle_timeout whether the stream idle timer fired, and
+// the watchdog counters whether the Envoy worker threads were descheduled.
+func envoyStallCounters(ctx context.Context, ct *check.ConnectivityTest, nodeName string) string {
+	if nodeName == "" {
+		return ""
+	}
+
+	for _, cp := range ct.CiliumPods() {
+		if cp.Pod.Spec.NodeName != nodeName {
+			continue
+		}
+
+		// -f is applied by Envoy itself; the grep only drops the zero-valued
+		// series so the failure message stays readable.
+		const filter = "upstream_cx_(total|idle_timeout|destroy_with_active_rq|connect_fail)|downstream_rq_(idle_timeout|timeout|5xx)|watchdog_(miss|mega_miss)"
+		out, err := cp.K8sClient.ExecInPod(ctx, cp.Pod.Namespace, cp.Pod.Name, "cilium-agent",
+			[]string{"bash", "-c", "cilium-dbg envoy admin metrics -f '" + filter + "' 2>/dev/null | grep -vE ' 0$'"})
+		if err != nil {
+			return fmt.Sprintf("\n  [envoy-counters] %s: %s", cp.Pod.Name, err)
+		}
+		if trimmed := strings.TrimSpace(out.String()); trimmed != "" {
+			return fmt.Sprintf("\n  --- envoy nonzero stall counters on %s (%s) ---\n%s",
+				nodeName, cp.Pod.Name, trimmed)
+		}
+		return fmt.Sprintf("\n  [envoy-counters] %s: no matching nonzero counters", cp.Pod.Name)
+	}
+
+	return fmt.Sprintf("\n  [envoy-counters] no cilium pod found on node %s", nodeName)
 }
 
 // restartReason returns a human-readable, best-effort explanation of why the
