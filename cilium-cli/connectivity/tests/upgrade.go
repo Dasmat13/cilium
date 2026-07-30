@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -279,7 +281,12 @@ func armEnvoyCloseLoggers(ctx context.Context, ct *check.ConnectivityTest) {
 	for _, cp := range ct.CiliumPods() {
 		out, err := cp.K8sClient.ExecInPod(ctx, cp.Pod.Namespace, cp.Pod.Name, "cilium-agent",
 			[]string{"cilium-dbg", "envoy", "admin", "logging", "set", "loggers",
-				"connection=debug", "pool=debug", "client=debug", "upstream=debug"})
+				// router names the reset reason ("upstream reset: reset reason: ...",
+				// router.cc:1206) and connection names the peer at connect time
+				// ("connecting to {}", connection_impl.cc:923), keyed by the same
+				// ConnectionId as the "remote close" line.
+				"connection=debug", "pool=debug", "client=debug", "upstream=debug",
+				"router=debug", "http=debug", "filter=debug"})
 		if err != nil {
 			ct.Infof("[close-probe] %s: unable to raise Envoy loggers: %s", cp.Pod.Name, err)
 			continue
@@ -312,21 +319,70 @@ func envoyCloseEvidence(ctx context.Context, ct *check.ConnectivityTest, nodeNam
 
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "\n  --- envoy close evidence on %s (%s) ---", nodeName, pods.Items[0].Name)
-	var hits int
-	for line := range strings.SplitSeq(logs.String(), "\n") {
-		low := strings.ToLower(line)
-		if strings.Contains(low, "idle timeout") || strings.Contains(low, "drain") ||
-			strings.Contains(low, "closing") || strings.Contains(low, "remote close") ||
-			strings.Contains(low, "disconnect") {
-			fmt.Fprintf(&sb, "\n    %s", line)
-			if hits++; hits >= 60 {
-				sb.WriteString("\n    ... truncated")
+
+	// A previous run proved the killing event is "remote close" followed by
+	// "disconnect. resetting 1 pending requests" - the PEER closed, not Envoy.
+	// Keyword grepping cannot say which peer, because the address is only
+	// logged at connect time on a separate line. So first find the ConnectionIds
+	// that reset a pending request, then replay every line for those ids: that
+	// pulls in "connecting to <addr>" (connection_impl.cc:923) and "upstream
+	// reset: reset reason: ..." (router.cc:1206) for the same connection.
+	connIDRe := regexp.MustCompile(`"ConnectionId":"(\d+)"`)
+	lines := strings.Split(logs.String(), "\n")
+
+	culprits := map[string]bool{}
+	for _, line := range lines {
+		if !strings.Contains(line, "resetting") || !strings.Contains(line, "pending request") {
+			continue
+		}
+		if strings.Contains(line, "resetting 0 pending requests") {
+			continue // benign teardown of an unused pooled connection
+		}
+		if m := connIDRe.FindStringSubmatch(line); m != nil {
+			culprits[m[1]] = true
+		}
+	}
+
+	if len(culprits) == 0 {
+		sb.WriteString("\n    (no connection reset a pending request in the retained log window)")
+		return sb.String()
+	}
+
+	ids := slices.Sorted(maps.Keys(culprits))
+	fmt.Fprintf(&sb, "\n    ConnectionIds that reset a pending request: %v", ids)
+	for _, id := range ids {
+		fmt.Fprintf(&sb, "\n    === full trail for ConnectionId %s ===", id)
+		want := `"ConnectionId":"` + id + `"`
+		var shown int
+		for _, line := range lines {
+			if !strings.Contains(line, want) {
+				continue
+			}
+			fmt.Fprintf(&sb, "\n      %s", line)
+			if shown++; shown >= 40 {
+				sb.WriteString("\n      ... truncated")
 				break
 			}
 		}
 	}
-	if hits == 0 {
-		sb.WriteString("\n    (no idle-timeout/drain/closing lines found - loggers may not have been raised, or the log rotated)")
+
+	// The reset reason and the upstream host are logged without a ConnectionId
+	// tag, so surface them separately.
+	fmt.Fprintf(&sb, "\n    === reset reasons / upstream hosts (untagged lines) ===")
+	var extra int
+	for _, line := range lines {
+		low := strings.ToLower(line)
+		if strings.Contains(low, "upstream reset") || strings.Contains(low, "connecting to") ||
+			strings.Contains(low, "transport failure reason") {
+			fmt.Fprintf(&sb, "\n      %s", line)
+			if extra++; extra >= 40 {
+				sb.WriteString("\n      ... truncated")
+				break
+			}
+		}
+	}
+	if extra == 0 {
+		sb.WriteString("\n      (none found)")
 	}
 
 	return sb.String()
