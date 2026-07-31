@@ -310,30 +310,28 @@ func envoyCloseEvidence(ctx context.Context, ct *check.ConnectivityTest, nodeNam
 		return ""
 	}
 
-	// Read via the agent on the same node: it mounts the same /var/run/cilium.
-	var cp *check.Pod
-	for _, p := range ct.CiliumPods() {
-		if p.Pod.Spec.NodeName == nodeName {
-			cp = &p
-			break
-		}
-	}
-	if cp == nil {
-		return fmt.Sprintf("\n  [close-probe] no cilium agent pod on node %s", nodeName)
+	// Read the cilium-envoy CONTAINER log. An earlier revision redirected Envoy
+	// to a file via envoy.log.path and read that instead; that was a mistake,
+	// because it emptied the container log the sysdump collects (the sysdump for
+	// run 30555072318 has 0 bytes of Envoy log on all three nodes) while the
+	// file itself is not collected at all. With container-log-max-size raised,
+	// the container log is both retained and archived, so use it.
+	pods, err := ct.K8sClient().ListPods(ctx, ct.Params().CiliumNamespace, metav1.ListOptions{
+		LabelSelector: "k8s-app=cilium-envoy",
+		FieldSelector: "spec.nodeName=" + nodeName,
+	})
+	if err != nil || len(pods.Items) == 0 {
+		return fmt.Sprintf("\n  [close-probe] no cilium-envoy pod on node %s (%v)", nodeName, err)
 	}
 
-	out, err := cp.K8sClient.ExecInPod(ctx, cp.Pod.Namespace, cp.Pod.Name, "cilium-agent",
-		[]string{"bash", "-c", "tail -c 20000000 /var/run/cilium/envoy/sockets/envoy.log 2>/dev/null || echo __NO_ENVOY_LOG_FILE__"})
-	if err != nil {
-		return fmt.Sprintf("\n  [close-probe] unable to read envoy.log on %s: %s", nodeName, err)
-	}
-	logs := out
-	if strings.Contains(logs.String(), "__NO_ENVOY_LOG_FILE__") {
-		return fmt.Sprintf("\n  [close-probe] %s: no envoy.log file (is envoy.log.path set?)", nodeName)
+	var logs bytes.Buffer
+	if err := ct.K8sClient().GetLogs(ctx, pods.Items[0].Namespace, pods.Items[0].Name, "cilium-envoy",
+		corev1.PodLogOptions{TailLines: ptr.To[int64](400000)}, &logs); err != nil {
+		return fmt.Sprintf("\n  [close-probe] unable to read %s logs: %s", pods.Items[0].Name, err)
 	}
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "\n  --- envoy close evidence on %s (from envoy.log, %d bytes) ---", nodeName, logs.Len())
+	fmt.Fprintf(&sb, "\n  --- envoy close evidence on %s (%s, %d bytes) ---", nodeName, pods.Items[0].Name, logs.Len())
 
 	// A previous run proved the killing event is "remote close" followed by
 	// "disconnect. resetting 1 pending requests" - the PEER closed, not Envoy.
