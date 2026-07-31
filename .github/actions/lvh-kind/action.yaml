@@ -90,6 +90,7 @@ runs:
           # in order to include them into the enviroment of kind.sh called
           # below, they also need to be set inside the ssh session.
           export KIND_EXPERIMENTAL_DOCKER_NETWORK=${KIND_EXPERIMENTAL_DOCKER_NETWORK@Q}
+          export CONTAINER_LOG_MAX_SIZE=${CONTAINER_LOG_MAX_SIZE@Q}
 
           if [ "${{ inputs.kind-config }}" != "" ]; then
             kind create cluster --config ${{ inputs.kind-config }}

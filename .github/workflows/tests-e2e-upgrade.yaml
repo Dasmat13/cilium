@@ -106,6 +106,10 @@ concurrency:
 
 env:
   test_concurrency: 5
+  # WIP DO NOT MERGE: cilium-agent and cilium-envoy debug logging exceeds 1000
+  # lines/s, so the 10M default rotates the conn-disrupt failure window away
+  # before the sysdump runs. Consumed by contrib/scripts/kind.sh.
+  CONTAINER_LOG_MAX_SIZE: 500M
 
 jobs:
   commit-status-start:

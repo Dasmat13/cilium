@@ -345,6 +345,22 @@ func envoyCloseEvidence(ctx context.Context, ct *check.ConnectivityTest, nodeNam
 	connIDRe := regexp.MustCompile(`"ConnectionId":"(\d+)"`)
 	lines := strings.Split(logs.String(), "\n")
 
+	// Every reset found so far turned out to be the xDS socket, not the
+	// conn-disrupt request: ConnectionId 21 / 5 were "connecting to
+	// /var/run/cilium/envoy/sockets/xds.sock", their pending request was the ADS
+	// gRPC stream, and they preceded the client death by 70-88s. That is normal
+	// agent-restart churn. So build the set of ConnectionIds that are xDS (or
+	// any other unix socket) and exclude them.
+	xdsIDs := map[string]bool{}
+	for _, line := range lines {
+		if !strings.Contains(line, "connecting to") || !strings.Contains(line, ".sock") {
+			continue
+		}
+		if m := connIDRe.FindStringSubmatch(line); m != nil {
+			xdsIDs[m[1]] = true
+		}
+	}
+
 	culprits := map[string]bool{}
 	for _, line := range lines {
 		if !strings.Contains(line, "resetting") || !strings.Contains(line, "pending request") {
@@ -354,8 +370,37 @@ func envoyCloseEvidence(ctx context.Context, ct *check.ConnectivityTest, nodeNam
 			continue // benign teardown of an unused pooled connection
 		}
 		if m := connIDRe.FindStringSubmatch(line); m != nil {
+			if xdsIDs[m[1]] {
+				continue // xDS/unix-socket connection, not the conn-disrupt request
+			}
 			culprits[m[1]] = true
 		}
+	}
+	if len(xdsIDs) > 0 {
+		fmt.Fprintf(&sb, "\n    (excluded %d unix-socket/xDS ConnectionIds)", len(xdsIDs))
+	}
+
+	// The conn-disrupt request is HTTP over TCP to port 8000, so surface every
+	// stream whose route/host mentions it, plus any non-xDS upstream reset.
+	// This is the trail that matters and that no previous probe isolated.
+	fmt.Fprintf(&sb, "\n    === port-8000 / non-xDS stream trail ===")
+	var t int
+	for _, line := range lines {
+		if strings.Contains(line, ".sock") {
+			continue
+		}
+		if !strings.Contains(line, ":8000") && !strings.Contains(line, "upstream reset") &&
+			!strings.Contains(line, "/echo") {
+			continue
+		}
+		fmt.Fprintf(&sb, "\n      %s", line)
+		if t++; t >= 80 {
+			sb.WriteString("\n      ... truncated")
+			break
+		}
+	}
+	if t == 0 {
+		sb.WriteString("\n      (nothing found - the request may not have reached this node's Envoy)")
 	}
 
 	if len(culprits) == 0 {

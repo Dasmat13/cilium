@@ -28,6 +28,10 @@ default_apiserver_port=0 # kind will randomly select
 default_kubeconfig=""
 default_external_dns="1.1.1.1"
 secondary_network="${default_network}-secondary"
+# Per-container log retention. Debug/trace logging from cilium-agent and
+# cilium-envoy can exceed 1000 lines/s, which rotates a failure window away
+# before a sysdump can collect it. Override with CONTAINER_LOG_MAX_SIZE.
+container_log_max_size="${CONTAINER_LOG_MAX_SIZE:-10M}"
 
 PROG=${0}
 
@@ -248,7 +252,12 @@ kubeadmConfigPatches:
     kind: InitConfiguration
     nodeRegistration:
       kubeletExtraArgs:
-        container-log-max-size: "10M"
+        container-log-max-size: "${container_log_max_size}"
+  - |
+    kind: JoinConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        container-log-max-size: "${container_log_max_size}"
 EOF
 
 if [ "${secondary_network_flag}" = true ]; then
